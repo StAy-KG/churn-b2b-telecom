@@ -1,141 +1,149 @@
 # B2B Subscriber Churn Prediction — Telecom ML Pipeline
 
-> End-to-end production ML system for predicting B2B subscriber churn in a Central Asian telecom operator. From raw monthly data in ClickHouse to a scored retention list ready for the call center.
+> End-to-end ML pipeline for predicting telecom subscriber churn. From raw customer data to a scored retention list, with a dual-branch architecture (Logistic Regression baseline + CatBoost production model).
+
+**Dataset:** IBM Telco Customer Churn (7,043 customers, 20 features) — used as a public substitute to demonstrate the pipeline architecture originally built on proprietary B2B ClickHouse data.
 
 ---
 
 ## Results
 
-| Metric | CV (Fold 5) | OOT (held-out) |
+| Metric | LogReg Baseline | CatBoost |
 |---|---|---|
-| ROC-AUC | 0.8078 | 0.8062 |
-| PR-AUC | 0.1269 | 0.1253 |
-| Optimal threshold | — | **0.18** (vs default 0.5) |
-| Class imbalance | ~27:1 | ~27:1 |
+| ROC-AUC | 0.840 ± 0.014 | **0.849 ± 0.009** |
+| PR-AUC | 0.654 ± 0.022 | **0.665 ± 0.016** |
+| Optimal threshold | — | **0.40** (vs default 0.5) |
+| At threshold: Precision / Recall / F1 | — | 0.531 / 0.799 / 0.638 |
+| Class imbalance | ~2.8:1 | ~2.8:1 |
+| Validation | Stratified K-Fold (5 folds) | Stratified K-Fold (5 folds) |
 
-> **Note:** With a 27:1 class imbalance, PR-AUC is the primary business metric — ROC-AUC is reported for benchmarking. The gap between CV and OOT is <0.2%, confirming the temporal fold structure is leak-free.
+> CatBoost outperforms LogReg on both metrics with lower variance across folds (±0.009 vs ±0.014 ROC-AUC). Threshold tuned to maximize F1 — prioritizing Recall (0.80) since missing a churner costs more than a false alarm in a retention context.
 
 ---
 
 ## Architecture
 
 ```
-ClickHouse (raw monthly ABT)
+IBM Telco CSV (raw)
         │
         ▼
-01_data_prep_eda.ipynb       — M2M filtering, device registry repair, null cleanup
+01_data_prep_eda.ipynb       — null cleanup, binary encoding, EDA visualizations
         │
         ▼
-02_feature_engineering.ipynb — Ratios, Velocity (V1/V3), Acceleration, Revival flags
+02_feature_engineering.ipynb — service ratios, bill shock index, tenure bands, loyalty flags
         │
-        ├──► df_logreg.parquet    (OHE, no multicollinear features)
-        └──► df_catboost.parquet  (raw categoricals, no OHE)
-        │
-        ▼
-03_model_training.ipynb      — Hybrid CV (Sliding + Expanding Window), LogReg baseline + CatBoost
+        ├──► df_logreg.parquet    (OHE, multicollinear features dropped)
+        └──► df_catboost.parquet  (raw string categoricals, full feature set)
         │
         ▼
-run_optuna.py                — Multi-GPU Optuna search (4× NVIDIA A16, ~2.3× speedup)
+03_model_training.ipynb      — Stratified K-Fold CV, LogReg baseline + CatBoost + threshold tuning
         │
         ▼
-05_inference_pipeline.ipynb  — Monthly batch scoring → Excel retention list for call center
+run_optuna.py                — Optuna hyperparameter search (multi-GPU ready)
 ```
 
 ---
 
 ## Key Engineering Decisions
 
-### Temporal validation (no data leakage)
-Churn is defined as: active in month **t**, no activity in month **t+1**. Features are computed from month **t-1** (lag-1 design), so the model never sees future data. Validation uses a hybrid scheme:
+### Dual-branch pipeline
 
-- **Sliding window** (Folds 1–2): 3-month rolling train, 1-month val — tests short-term stability
-- **Expanding window** (Folds 3–5): growing train set, 1-month val — tests generalization over time
-
-### Feature engineering: behavioral dynamics
-Beyond static features, the pipeline captures *change signals* — how a subscriber's behavior is evolving:
-
-- **Velocity V1**: `metric[t] / metric[t-1]` — month-over-month ratio
-- **Velocity V3**: `metric[t] / rolling_mean(t-3:t-1)` — smoothed trend
-- **Acceleration**: `V1[t] - V1[t-1]` — rate of change of the ratio
-- **Revival flags**: binary indicator when a previously-zero metric becomes non-zero (resurrection signal)
-- **Loyalty ratios**: LTE share, on-net voice ratio, network isolation index
-
-All velocity features are clipped using empirically derived percentile bounds per feature to prevent extreme outliers from dominating.
-
-### Two-branch pipeline
-The feature matrix is split at engineering time into two branches:
+The feature matrix splits at engineering time into two branches:
 
 | Branch | Purpose | Key differences |
 |---|---|---|
-| `df_logreg` | Linear baseline | OHE categoricals, V3/Accel dropped (overfits in linear models) |
-| `df_catboost` | Production model | Raw string categoricals, full feature set |
+| `df_logreg` | Linear baseline | OHE categoricals, multicollinear features dropped (TotalCharges = MonthlyCharges × tenure) |
+| `df_catboost` | Production model | Raw string categoricals (CatBoost handles natively), full feature set |
+
+### Feature engineering: behavioral proxies
+
+- **Bill Shock Index**: `MonthlyCharges / Avg_Lifetime_Charge` — detects charge spikes vs historical average
+- **Service intensity ratios**: `Streaming_Ratio`, `Protection_Ratio`, `Charge_Per_Service` — measure engagement depth and switching cost
+- **Lifecycle flags**: `Is_NewCustomer` (≤6 months), `Is_Established`, `Is_Loyal` (>24 months)
+- **Contract risk score**: ordinal encoding (Month-to-month=2, One year=1, Two year=0) — churn rate 42.7% vs 2.8% across extremes
+- **Digital risk combo**: `Is_ElectronicCheck × PaperlessBilling` — interaction flag for highest-churn payment segment
 
 ### Class imbalance handling
-With ~27:1 imbalance, standard 0.5 threshold is useless. Approach:
-- `auto_class_weights='SqrtBalanced'` in CatBoost (outperformed `scale_pos_weight`)
-- Optimal classification threshold tuned to **0.18** via precision-recall curve
-- Business filter: score ≥ 0.40 AND `DATE_LAD_days ≤ 1` (only actively-using subscribers, avoids wasting retention budget on already-churned accounts)
 
-### Multi-GPU hyperparameter search
-Optuna study distributed across 4 GPUs using `multiprocessing` + `JournalFileBackend` (file-based storage avoids Jupyter pickling issues). GPU availability checked dynamically before launch. Achieved ~2.3× wall-clock speedup vs single-GPU.
+With 2.8:1 imbalance, default 0.5 threshold recovers only ~50% of churners:
+- `auto_class_weights='SqrtBalanced'` in CatBoost
+- Optimal threshold tuned to **0.40** via precision-recall curve
+- Result: Recall 0.80 — catches 4 out of 5 churners before they leave
 
-Memory optimization: `gpu_cat_features_storage='CpuPinned'` + `borders_count=64` to prevent CUDA OOM across parallel workers.
+### Feature contract (JSON)
+
+Feature lists locked at engineering time and loaded by all downstream notebooks — prevents train/inference skew.
+
+### Hyperparameter search (Optuna)
+
+`run_optuna.py` runs a distributed Optuna study using `multiprocessing` + `JournalFileBackend`. Detects free GPUs via `nvidia-smi` dynamically, falls back to CPU automatically.
+
+---
+
+## Top Feature Importances (CatBoost)
+
+| Rank | Feature | Note |
+|---|---|---|
+| 1 | Contract | Month-to-month 15× higher churn than two-year |
+| 2 | InternetService | Fiber optic: 42% churn rate |
+| 3 | Contract_Risk | Engineered ordinal encoding ✓ |
+| 4 | Tenure_Band | Engineered lifecycle bucket ✓ |
+| 5 | tenure | Raw tenure in months |
+| 6 | PaymentMethod | Electronic check: highest-risk segment |
+| 9 | Bill_Shock_Index | Engineered behavioral proxy ✓ |
+| 10 | Streaming_Ratio | Engineered engagement ratio ✓ |
+
+Engineered features appear in top 10 — confirming feature construction adds signal beyond raw attributes.
+
+---
+
+## EDA Highlights
+
+| Finding | Value |
+|---|---|
+| Overall churn rate | 26.5% |
+| Month-to-month churn | 42.7% |
+| Two-year contract churn | 2.8% |
+| Fiber optic churn | 41.9% |
+| Median tenure (churned) | 10 months |
+| Median tenure (retained) | 38 months |
 
 ---
 
 ## Stack
 
-- **Data warehouse**: ClickHouse
-- **Processing**: pandas, NumPy
-- **Models**: CatBoost, scikit-learn (LogisticRegression baseline)
+- **Models**: CatBoost, scikit-learn (LogisticRegression)
 - **Hyperparameter tuning**: Optuna (multi-GPU, JournalStorage)
-- **Validation**: custom temporal CV (sliding + expanding window)
-- **Output**: Excel retention list with churn probability scores
+- **Processing**: pandas, NumPy
+- **Validation**: Stratified K-Fold (5 folds)
+- **Visualization**: matplotlib, seaborn
 
 ---
 
 ## Project Structure
 
 ```
-churn_b2b/
-├── data/
-│   ├── raw/                  # Monthly ABT parquets from ClickHouse
-│   ├── interim/              # Cleaned + feature-engineered checkpoints
-│   └── processed/            # Final model-ready datasets
-├── models/
-│   └── catboost_b2b_churn_sniper_v1.cbm
+churn-b2b-telecom/
+├── data/raw/
+│   └── telco_churn_raw.csv            # IBM Telco public dataset
 ├── notebooks/
 │   ├── 01_data_prep_eda.ipynb
 │   ├── 02_feature_engineering.ipynb
-│   ├── 03_model_training.ipynb
-│   └── 05_inference_pipeline.ipynb
+│   └── 03_model_training.ipynb
 ├── reports/
-│   └── churn_predict_YYYY-Month_top_sniper.xlsx
-├── run_optuna.py             # Multi-GPU Optuna worker
-├── feature_lists.json        # Feature contract (locked at training time)
+│   ├── 01_eda_churn_patterns.png
+│   └── 03_model_results.png
+├── run_optuna.py                       # Multi-GPU Optuna worker
+├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## Inference Pipeline
+## What I'd Improve Next
 
-The production scoring script (`05_inference_pipeline.ipynb`) runs monthly:
-
-1. Loads raw data for month **t** (requires 4–5 month buffer for lag features)
-2. Applies full feature engineering pipeline (same transforms as training)
-3. Scores all active subscribers
-4. Applies business filters (score threshold + recency filter)
-5. Outputs ranked Excel file auto-named for month **t+1**
-
-Output columns: `CTN`, `Score`, `DATE_LAD_days`, `TOTAL_MOU`, `BALANCE_END`, `PRICE_PLAN_FIXED`
-
----
-
-## What I'd improve next
-
-- **Switch primary metric to PR-AUC** in Optuna objective (currently optimizes ROC-AUC — a known limitation)
-- **MLflow tracking** for experiment reproducibility
-- **FastAPI wrapper** around the inference pipeline for on-demand scoring
-- **SHAP explanations** per subscriber in the output list (explainability for retention agents)
-- Containerize with Docker for deployment-agnostic runs
+- **MLflow tracking** — experiment reproducibility across Optuna trials
+- **FastAPI wrapper** — on-demand scoring endpoint instead of batch notebook
+- **SHAP explanations** — per-customer feature contribution for retention agents
+- **Docker containerization** — deployment-agnostic inference pipeline
+- **Switch Optuna objective to PR-AUC** — more informative than ROC-AUC under class imbalance
